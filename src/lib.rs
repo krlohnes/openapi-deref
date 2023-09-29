@@ -58,16 +58,61 @@ pub fn ref_to_json_path(ref_str: &str) -> Result<String, OpenApiError> {
 }
 
 impl OpenApiDereferenceer {
-    //TODO implement this for more than just components
     pub fn dereference(mut self) -> Result<OpenApiV3_1, OpenApiError> {
         let components: Option<Components> = self.openapi.components.take();
-        self.openapi.components = self.dereference_components(components)?;
+        self.openapi.components = self.dereference_components(&components)?;
         Ok(self.openapi)
+    }
+
+    fn dereference_header(&self, mut header: Header) -> Result<Header> {
+        let res: Result<IndexMap<String, ReferenceOr<Example>>, OpenApiError> = header
+            .examples
+            .into_iter()
+            .map(|(k, v)| {
+                let new_v = self.dereference_reference(v)?;
+                Ok((k, new_v))
+            })
+            .collect();
+        header.examples = res?;
+    }
+
+    fn dereference_parameter(&self, mut parameter: Parameter) -> Result<Parameter> {
+        let res: Result<IndexMap<String, ReferenceOr<Example>>, OpenApiError> = parameter
+            .examples
+            .into_iter()
+            .map(|(k, v)| {
+                let new_v = self.dereference_reference(v)?;
+                Ok((k, new_v))
+            })
+            .collect();
+        parameter.examples = res?;
+    }
+
+    fn dereference_response(&self, mut response: Response) -> Result<Response> {
+        let res: Result<IndexMap<String, ReferenceOr<Header>>, OpenApiError> = response
+            .headers
+            .into_iter()
+            .map(|(k, v)| {
+                let new_v = self.dereference_reference(v)?;
+                Ok((k, new_v))
+            })
+            .collect();
+        reponse.headers = res?;
+        let res: Result<IndexMap<String, ReferenceOr<Link>>, OpenApiError> = reponse
+            .links
+            .into_iter()
+            .map(|(k, v)| {
+                let new_v = self.dereference_reference(v)?;
+                Ok((k, new_v))
+            })
+            .collect();
+        response.links = res?;
+        Ok(response)
     }
 
     fn dereference_components(
         &self,
-        components: Option<Components>,
+        components: &Option<Components>,
     ) -> Result<Option<Components>, OpenApiError> {
         //Extensions can't be references
         //Schemas can't be references
@@ -86,8 +131,8 @@ impl OpenApiDereferenceer {
                 .responses
                 .into_iter()
                 .map(|(k, v)| {
-                    let new_v = self.dereference_reference(v)?;
-                    Ok((k, new_v))
+                    let mut new_v = self.dereference_reference(v)?;
+                    Ok((k, self.dereference_response(new_v)?))
                 })
                 .collect();
             components.responses = res?;
@@ -191,19 +236,19 @@ impl OpenApiDereferenceer {
                         .map_err(|_| OpenApiError::ParsingError)?,
                 )
                 .unwrap();
-                Ok(ReferenceOr::DereferenceedReference {
+                Ok(ReferenceOr::DereferencedReference {
                     reference,
                     summary,
                     description,
                     item,
                 })
             }
-            ReferenceOr::DereferenceedReference {
+            ReferenceOr::DereferencedReference {
                 reference,
                 summary,
                 description,
                 item,
-            } => Ok(ReferenceOr::DereferenceedReference {
+            } => Ok(ReferenceOr::DereferencedReference {
                 reference,
                 summary,
                 description,
