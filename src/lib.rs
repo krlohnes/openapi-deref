@@ -4,8 +4,8 @@ use std::str::FromStr;
 use indexmap::IndexMap;
 use jsonpath_rust::JsonPathQuery;
 use openapiv3::v3_1::{
-    Callback, Components, Example, Header, Link, OpenApi as OpenApiV3_1, Parameter, PathItem,
-    ReferenceOr, RequestBody, Response, SecurityScheme,
+    Callback, Components, Example, Header, Link, OpenApi as OpenApiV3_1, Parameter, ParameterData,
+    PathItem, ReferenceOr, RequestBody, Response, SecurityScheme,
 };
 use openapiv3::versioned::OpenApi;
 use snafu::prelude::*;
@@ -60,11 +60,11 @@ pub fn ref_to_json_path(ref_str: &str) -> Result<String, OpenApiError> {
 impl OpenApiDereferenceer {
     pub fn dereference(mut self) -> Result<OpenApiV3_1, OpenApiError> {
         let components: Option<Components> = self.openapi.components.take();
-        self.openapi.components = self.dereference_components(&components)?;
+        self.openapi.components = self.dereference_components(components)?;
         Ok(self.openapi)
     }
 
-    fn dereference_header(&self, mut header: Header) -> Result<Header> {
+    fn dereference_header(&self, mut header: Header) -> Result<Header, OpenApiError> {
         let res: Result<IndexMap<String, ReferenceOr<Example>>, OpenApiError> = header
             .examples
             .into_iter()
@@ -74,10 +74,15 @@ impl OpenApiDereferenceer {
             })
             .collect();
         header.examples = res?;
+        Ok(header)
     }
 
-    fn dereference_parameter(&self, mut parameter: Parameter) -> Result<Parameter> {
-        let res: Result<IndexMap<String, ReferenceOr<Example>>, OpenApiError> = parameter
+    fn dereference_parameter_data(
+        &self,
+        mut parameter_data: ParameterData,
+    ) -> Result<ParameterData, OpenApiError> {
+        //Note examples can have external values, but we don't care at the moment.
+        let res: Result<IndexMap<String, ReferenceOr<Example>>, OpenApiError> = parameter_data
             .examples
             .into_iter()
             .map(|(k, v)| {
@@ -85,10 +90,48 @@ impl OpenApiDereferenceer {
                 Ok((k, new_v))
             })
             .collect();
-        parameter.examples = res?;
+        parameter_data.examples = res?;
+        Ok(parameter_data)
     }
 
-    fn dereference_response(&self, mut response: Response) -> Result<Response> {
+    fn dereference_parameter(&self, parameter: Parameter) -> Result<Parameter, OpenApiError> {
+        match parameter {
+            Parameter::Query {
+                parameter_data,
+                allow_reserved,
+                style,
+                allow_empty_value,
+            } => Ok(Parameter::Query {
+                parameter_data: self.dereference_parameter_data(parameter_data)?,
+                allow_reserved,
+                style,
+                allow_empty_value,
+            }),
+            Parameter::Header {
+                parameter_data,
+                style,
+            } => Ok(Parameter::Header {
+                parameter_data: self.dereference_parameter_data(parameter_data)?,
+                style,
+            }),
+            Parameter::Path {
+                parameter_data,
+                style,
+            } => Ok(Parameter::Path {
+                parameter_data: self.dereference_parameter_data(parameter_data)?,
+                style,
+            }),
+            Parameter::Cookie {
+                parameter_data,
+                style,
+            } => Ok(Parameter::Cookie {
+                parameter_data: self.dereference_parameter_data(parameter_data)?,
+                style,
+            }),
+        }
+    }
+
+    fn dereference_response(&self, mut response: Response) -> Result<Response, OpenApiError> {
         let res: Result<IndexMap<String, ReferenceOr<Header>>, OpenApiError> = response
             .headers
             .into_iter()
@@ -97,8 +140,8 @@ impl OpenApiDereferenceer {
                 Ok((k, new_v))
             })
             .collect();
-        reponse.headers = res?;
-        let res: Result<IndexMap<String, ReferenceOr<Link>>, OpenApiError> = reponse
+        response.headers = res?;
+        let res: Result<IndexMap<String, ReferenceOr<Link>>, OpenApiError> = response
             .links
             .into_iter()
             .map(|(k, v)| {
@@ -112,7 +155,7 @@ impl OpenApiDereferenceer {
 
     fn dereference_components(
         &self,
-        components: &Option<Components>,
+        components: Option<Components>,
     ) -> Result<Option<Components>, OpenApiError> {
         //Extensions can't be references
         //Schemas can't be references
@@ -131,8 +174,25 @@ impl OpenApiDereferenceer {
                 .responses
                 .into_iter()
                 .map(|(k, v)| {
-                    let mut new_v = self.dereference_reference(v)?;
-                    Ok((k, self.dereference_response(new_v)?))
+                    let new_v = self.dereference_reference(v)?;
+                    if let ReferenceOr::DereferencedReference {
+                        reference,
+                        summary,
+                        description,
+                        item,
+                    } = new_v
+                    {
+                        return Ok((
+                            k,
+                            ReferenceOr::DereferencedReference {
+                                reference,
+                                summary,
+                                description,
+                                item: self.dereference_response(item)?,
+                            },
+                        ));
+                    }
+                    Ok((k, new_v))
                 })
                 .collect();
             components.responses = res?;
@@ -141,6 +201,23 @@ impl OpenApiDereferenceer {
                 .into_iter()
                 .map(|(k, v)| {
                     let new_v = self.dereference_reference(v)?;
+                    if let ReferenceOr::DereferencedReference {
+                        reference,
+                        summary,
+                        description,
+                        item,
+                    } = new_v
+                    {
+                        return Ok((
+                            k,
+                            ReferenceOr::DereferencedReference {
+                                reference,
+                                summary,
+                                description,
+                                item: self.dereference_parameter(item)?,
+                            },
+                        ));
+                    }
                     Ok((k, new_v))
                 })
                 .collect();
@@ -177,6 +254,23 @@ impl OpenApiDereferenceer {
                 .into_iter()
                 .map(|(k, v)| {
                     let new_v = self.dereference_reference(v)?;
+                    if let ReferenceOr::DereferencedReference {
+                        reference,
+                        summary,
+                        description,
+                        item,
+                    } = new_v
+                    {
+                        return Ok((
+                            k,
+                            ReferenceOr::DereferencedReference {
+                                reference,
+                                summary,
+                                description,
+                                item: self.dereference_header(item)?,
+                            },
+                        ));
+                    }
                     Ok((k, new_v))
                 })
                 .collect();
@@ -192,6 +286,7 @@ impl OpenApiDereferenceer {
                 .collect();
             components.links = res?;
 
+            //I don't think we care about callbacks for the moment.
             let res: Result<IndexMap<String, ReferenceOr<Callback>>, OpenApiError> = components
                 .callbacks
                 .into_iter()
@@ -202,6 +297,7 @@ impl OpenApiDereferenceer {
                 .collect();
             components.callbacks = res?;
 
+            //TODO handle the path item here. This is a big chunk of refs
             let res: Result<IndexMap<String, ReferenceOr<PathItem>>, OpenApiError> = components
                 .path_items
                 .into_iter()

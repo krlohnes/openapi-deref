@@ -15,4 +15,4 @@ snafu = "0.7.5"
 
 [dependencies.openapiv3]
 git = "ssh://git@github.com/krlohnes/openapiv3.git"
-rev = "20b8d5cb3fb75bd8a909d7e06a388b530cb71f52"
+rev = "25f9af7e5e10d821d52e88aa580cd225555b1ff5"
