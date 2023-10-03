@@ -3,9 +3,11 @@ use std::str::FromStr;
 
 use indexmap::IndexMap;
 use jsonpath_rust::JsonPathQuery;
+use openapiv3::schemars::schema::{Schema as SchemarsSchema, SchemaObject as SchemarsSchemaObject};
 use openapiv3::v3_1::{
     Callback, Components, Example, Header, Link, OpenApi as OpenApiV3_1, Operation, Parameter,
-    ParameterData, PathItem, Paths, ReferenceOr, RequestBody, Response, SecurityScheme, StatusCode,
+    ParameterData, PathItem, Paths, ReferenceOr, RequestBody, Response, SchemaObject,
+    SecurityScheme, StatusCode,
 };
 use openapiv3::versioned::OpenApi;
 use snafu::prelude::*;
@@ -64,6 +66,34 @@ impl OpenApiDereferencer {
         let paths: Option<Paths> = self.openapi.paths.take();
         self.openapi.paths = self.dereference_paths(paths)?;
         Ok(self.openapi)
+    }
+
+    fn dereference_and_merge_schemas(
+        &self,
+        mut schema: SchemaObject,
+    ) -> Result<SchemaObject, OpenApiError> {
+        schema.json_schema = match schema.json_schema {
+            SchemarsSchema::Bool(b) => SchemarsSchema::Bool(b),
+            SchemarsSchema::Object(s) => {
+                let s = if s.is_ref() {
+                    let jp = ref_to_json_path(&s.reference.unwrap())?;
+                    serde_json::from_value(
+                        (&self.json)
+                            .clone()
+                            .path(&jp)
+                            .map_err(|_| OpenApiError::ParsingError)?,
+                    )
+                    .map_err(|_| OpenApiError::ParsingError)?
+                } else {
+                    s
+                };
+                //TODO We should merge and flatten the various subschemas here too.
+                //We can get the various Schema objects from here and use json-patch to merge them
+                //together, or at least to attempt to.
+                SchemarsSchema::Object(s)
+            }
+        };
+        Ok(schema)
     }
 
     fn dereference_operation(&self, mut operation: Operation) -> Result<Operation, OpenApiError> {
@@ -287,8 +317,6 @@ impl OpenApiDereferencer {
         &self,
         components: Option<Components>,
     ) -> Result<Option<Components>, OpenApiError> {
-        //Extensions can't be references
-        //Schemas can't be references
         if let Some(mut components) = components {
             components.security_schemes = components
                 .security_schemes
@@ -310,6 +338,11 @@ impl OpenApiDereferencer {
                     ))
                 })
                 .collect::<Result<IndexMap<String, ReferenceOr<Response>>, OpenApiError>>()?;
+            components.schemas = components
+                .schemas
+                .into_iter()
+                .map(|(k, v)| Ok((k, self.dereference_and_merge_schemas(v)?)))
+                .collect::<Result<IndexMap<String, SchemaObject>, OpenApiError>>()?;
             components.parameters = components
                 .parameters
                 .into_iter()
@@ -405,7 +438,7 @@ impl OpenApiDereferencer {
                         .path(&jp)
                         .map_err(|_| OpenApiError::ParsingError)?,
                 )
-                .unwrap();
+                .map_err(|_| OpenApiError::ParsingError)?;
                 Ok(ReferenceOr::DereferencedReference {
                     reference,
                     summary,
