@@ -1,8 +1,11 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use indexmap::IndexMap;
-use jsonpath_rust::JsonPathQuery;
+use jsonpath_rust::JsonPathInst;
 use openapiv3::schemars::schema::{Schema as SchemarsSchema, SchemaObject as SchemarsSchemaObject};
 use openapiv3::v3_1::{
     Callback, Components, Example, Header, Link, OpenApi as OpenApiV3_1, Operation, Parameter,
@@ -15,12 +18,14 @@ use snafu::prelude::*;
 pub struct OpenApiDereferencer {
     pub json: serde_json::Value,
     pub openapi: OpenApiV3_1,
+    //TODO I'm meh on RefCell here
+    pub serde_values: RefCell<HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Snafu)]
 pub enum OpenApiError {
-    #[snafu(display("Error parsing open api spec"))]
-    ParsingError,
+    #[snafu(display("Error parsing open api spec {msg}"))]
+    ParsingError { msg: String },
     #[snafu(display("References must be in the same file with the format #..."))]
     UnsupportedRefFormat,
     #[snafu(display("Unsupported open api version"))]
@@ -31,11 +36,19 @@ impl FromStr for OpenApiDereferencer {
     type Err = OpenApiError;
     fn from_str(the_str: &str) -> Result<Self, OpenApiError> {
         let json: serde_json::Value =
-            serde_json::from_str(the_str).map_err(|_| OpenApiError::ParsingError)?;
+            serde_json::from_str(the_str).map_err(|e| OpenApiError::ParsingError {
+                msg: format!("Error parsing from string to serde {}", e.to_string()),
+            })?;
         let openapi: OpenApi =
-            serde_json::from_value(json.clone()).map_err(|_| OpenApiError::ParsingError)?;
+            serde_json::from_value(json.clone()).map_err(|e| OpenApiError::ParsingError {
+                msg: format!("Error parsing from serde to OpenApi {}", e.to_string()),
+            })?;
         match openapi {
-            OpenApi::Version31(openapi) => Ok(OpenApiDereferencer { json, openapi }),
+            OpenApi::Version31(openapi) => Ok(OpenApiDereferencer {
+                json,
+                openapi,
+                serde_values: HashMap::default().into(),
+            }),
             _ => return Err(OpenApiError::UnsupportedOpenApiVersion),
         }
     }
@@ -47,9 +60,10 @@ pub fn ref_to_json_path(ref_str: &str) -> Result<String, OpenApiError> {
     if first_char.is_none() || first_char.unwrap() != '#' {
         return Err(OpenApiError::UnsupportedRefFormat);
     }
+    chars.next();
     let path_str: String = chars.collect();
     let path = PathBuf::from(&path_str);
-    let mut json_path: String = "".into();
+    let mut json_path: String = "$".into();
     for p in path.into_iter() {
         if let Some(p) = p.to_str() {
             json_path += ".";
@@ -77,16 +91,11 @@ impl OpenApiDereferencer {
             SchemarsSchema::Object(s) => {
                 let s = if s.is_ref() {
                     let jp = ref_to_json_path(&s.reference.unwrap())?;
-                    serde_json::from_value(
-                        (&self.json)
-                            .clone()
-                            .path(&jp)
-                            .map_err(|_| OpenApiError::ParsingError)?,
-                    )
-                    .map_err(|_| OpenApiError::ParsingError)?
+                    self.dereference_type(&jp)?
                 } else {
                     s
                 };
+                //println!("Schema! {:#?}", s);
                 //TODO We should merge and flatten the various subschemas here too.
                 //We can get the various Schema objects from here and use json-patch to merge them
                 //together, or at least to attempt to.
@@ -220,7 +229,7 @@ impl OpenApiDereferencer {
                     Ok((k, new_v))
                 })
                 .collect::<Result<IndexMap<String, ReferenceOr<PathItem>>, OpenApiError>>()?;
-            unimplemented!()
+            Ok(Some(paths))
         } else {
             return Ok(None);
         }
@@ -420,6 +429,29 @@ impl OpenApiDereferencer {
         }
     }
 
+    fn dereference_type<T: serde::de::DeserializeOwned>(
+        &self,
+        reference: &str,
+    ) -> Result<T, OpenApiError> {
+        let mut cache = self.serde_values.borrow_mut();
+        let value = if let Some(v) = cache.get(reference) {
+            v
+        } else {
+            let jp = ref_to_json_path(&reference)?;
+            let query = JsonPathInst::from_str(&jp).map_err(|e| OpenApiError::ParsingError {
+                msg: format!("Error creating json path {jp}, {e}"),
+            })?;
+            let path_result = query.find_slice(&self.json);
+            //TODO Reading the spec, I don't _think_ this needs to work for arrays.
+            let v = path_result.get(0).take().unwrap().deref();
+            cache.insert(reference.into(), v.to_owned());
+            &cache.get(reference).unwrap()
+        };
+        serde_json::from_value(value.clone()).map_err(|e| OpenApiError::ParsingError {
+            msg: format!("Error with serde parsing {e} {reference}"),
+        })
+    }
+
     fn dereference_reference<T: serde::de::DeserializeOwned>(
         &self,
         v: ReferenceOr<T>,
@@ -431,14 +463,7 @@ impl OpenApiDereferencer {
                 summary,
                 description,
             } => {
-                let jp = ref_to_json_path(&reference)?;
-                let item: T = serde_json::from_value(
-                    (&self.json)
-                        .clone()
-                        .path(&jp)
-                        .map_err(|_| OpenApiError::ParsingError)?,
-                )
-                .map_err(|_| OpenApiError::ParsingError)?;
+                let item = self.dereference_type(&reference)?;
                 Ok(ReferenceOr::DereferencedReference {
                     reference,
                     summary,
@@ -477,6 +502,27 @@ mod tests {
         }
         false
     }
+
+    #[test]
+    pub fn test_ref_to_json_path() -> Result<()> {
+        let reference = "#/components/parameters/pagination-before";
+        let expected = "$.components.parameters.pagination-before";
+        assert_eq!(expected, &ref_to_json_path(reference)?);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_file_ref_to_json_path() {
+        let reference = "//elsewhere/components/parameters/pagination-before";
+        assert!(ref_to_json_path(reference).is_err());
+    }
+
+    #[test]
+    pub fn test_http_ref_to_json_path() {
+        let reference = "http://mysite.com/components/parameters/pagination-before";
+        assert!(ref_to_json_path(reference).is_err());
+    }
+
     #[test]
     pub fn test_github_api_from_3_1_api() -> Result<()> {
         //NOTE: This is a sanity check. the github api doesn't have _everything_, but it
@@ -484,10 +530,10 @@ mod tests {
         //comprehensive in the future
         let spec = std::fs::read_to_string("oai_examples/api.github.com.json")?;
         let dereferencer = OpenApiDereferencer::from_str(&spec)?;
-        let dereferenceed = dereferencer.dereference()?;
+        let dereferenced = dereferencer.dereference()?;
 
-        assert!(dereferenceed.components.is_some());
-        let components = dereferenceed.components.unwrap();
+        assert!(dereferenced.components.is_some());
+        let components = dereferenced.components.unwrap();
         assert!(!components.security_schemes.iter().any(is_reference));
         assert!(!components.responses.iter().any(is_reference));
         assert!(!components.parameters.iter().any(is_reference));
