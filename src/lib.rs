@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use indexmap::IndexMap;
 use jsonpath_rust::JsonPathInst;
-use openapiv3::schemars::schema::{Schema as SchemarsSchema, SchemaObject as SchemarsSchemaObject};
+use openapiv3::schemars::schema::Schema as SchemarsSchema;
 use openapiv3::v3_1::{
     Callback, Components, Example, Header, Link, OpenApi as OpenApiV3_1, Operation, Parameter,
     ParameterData, PathItem, Paths, ReferenceOr, RequestBody, Response, SchemaObject,
@@ -36,11 +36,11 @@ impl FromStr for OpenApiDereferencer {
     fn from_str(the_str: &str) -> Result<Self, OpenApiError> {
         let json: serde_json::Value =
             serde_json::from_str(the_str).map_err(|e| OpenApiError::ParsingError {
-                msg: format!("Error parsing from string to serde {}", e.to_string()),
+                msg: format!("Error parsing from string to serde {}", e),
             })?;
         let openapi: OpenApi =
             serde_json::from_value(json.clone()).map_err(|e| OpenApiError::ParsingError {
-                msg: format!("Error parsing from serde to OpenApi {}", e.to_string()),
+                msg: format!("Error parsing from serde to OpenApi {}", e),
             })?;
         match openapi {
             OpenApi::Version31(openapi) => Ok(OpenApiDereferencer {
@@ -48,7 +48,7 @@ impl FromStr for OpenApiDereferencer {
                 openapi,
                 serde_values: HashMap::default().into(),
             }),
-            _ => return Err(OpenApiError::UnsupportedOpenApiVersion),
+            _ => Err(OpenApiError::UnsupportedOpenApiVersion),
         }
     }
 }
@@ -65,7 +65,7 @@ pub fn ref_to_json_path(ref_str: &str) -> Result<String, OpenApiError> {
     let path_str: String = chars.collect();
     let path = PathBuf::from(&path_str);
     let mut json_path: String = "$".into();
-    for p in path.into_iter() {
+    for p in path.iter() {
         if let Some(p) = p.to_str() {
             json_path += ".";
             json_path += p;
@@ -128,21 +128,21 @@ impl OpenApiDereferencer {
                             .if_schema
                             .map(|if_schema| {
                                 self.dereference_schemars_schema(*if_schema)
-                                    .map(|is| Box::new(is))
+                                    .map(Box::new)
                             })
                             .transpose()?;
                         subschemas.else_schema = subschemas
                             .else_schema
                             .map(|else_schema| {
                                 self.dereference_schemars_schema(*else_schema)
-                                    .map(|is| Box::new(is))
+                                    .map(Box::new)
                             })
                             .transpose()?;
                         subschemas.then_schema = subschemas
                             .then_schema
                             .map(|then_schema| {
                                 self.dereference_schemars_schema(*then_schema)
-                                    .map(|is| Box::new(is))
+                                    .map(Box::new)
                             })
                             .transpose()?;
                         Some(subschemas)
@@ -285,7 +285,7 @@ impl OpenApiDereferencer {
                 .collect::<Result<IndexMap<String, ReferenceOr<PathItem>>, OpenApiError>>()?;
             Ok(Some(paths))
         } else {
-            return Ok(None);
+            Ok(None)
         }
     }
 
@@ -491,7 +491,7 @@ impl OpenApiDereferencer {
         let value = if let Some(v) = cache.get(reference) {
             v
         } else {
-            let jp = ref_to_json_path(&reference)?;
+            let jp = ref_to_json_path(reference)?;
             let query = JsonPathInst::from_str(&jp).map_err(|e| OpenApiError::ParsingError {
                 msg: format!("Error creating json path {jp}, {e}"),
             })?;
@@ -499,7 +499,7 @@ impl OpenApiDereferencer {
             //TODO Reading the spec, I don't _think_ this needs to work for arrays.
             let v = path_result.get(0).take().unwrap().deref();
             cache.insert(reference.into(), v.to_owned());
-            &cache.get(reference).unwrap()
+            cache.get(reference).unwrap()
         };
         serde_json::from_value(value.clone()).map_err(|e| OpenApiError::ParsingError {
             msg: format!("Error with serde parsing {e} {reference}"),
