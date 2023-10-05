@@ -18,7 +18,6 @@ use snafu::prelude::*;
 pub struct OpenApiDereferencer {
     pub json: serde_json::Value,
     pub openapi: OpenApiV3_1,
-    //TODO I'm meh on RefCell here
     pub serde_values: RefCell<HashMap<String, serde_json::Value>>,
 }
 
@@ -26,8 +25,8 @@ pub struct OpenApiDereferencer {
 pub enum OpenApiError {
     #[snafu(display("Error parsing open api spec {msg}"))]
     ParsingError { msg: String },
-    #[snafu(display("References must be in the same file with the format #..."))]
-    UnsupportedRefFormat,
+    #[snafu(display("References must be in the same file and start with #, found {reference}"))]
+    UnsupportedRefFormat { reference: String },
     #[snafu(display("Unsupported open api version"))]
     UnsupportedOpenApiVersion,
 }
@@ -58,7 +57,9 @@ pub fn ref_to_json_path(ref_str: &str) -> Result<String, OpenApiError> {
     let mut chars = ref_str.chars();
     let first_char = chars.next();
     if first_char.is_none() || first_char.unwrap() != '#' {
-        return Err(OpenApiError::UnsupportedRefFormat);
+        return Err(OpenApiError::UnsupportedRefFormat {
+            reference: ref_str.into(),
+        });
     }
     chars.next();
     let path_str: String = chars.collect();
@@ -82,26 +83,79 @@ impl OpenApiDereferencer {
         Ok(self.openapi)
     }
 
-    fn dereference_and_merge_schemas(
+    fn dereference_schemars_schema(
         &self,
-        mut schema: SchemaObject,
-    ) -> Result<SchemaObject, OpenApiError> {
-        schema.json_schema = match schema.json_schema {
-            SchemarsSchema::Bool(b) => SchemarsSchema::Bool(b),
+        schema: SchemarsSchema,
+    ) -> Result<SchemarsSchema, OpenApiError> {
+        match schema {
+            SchemarsSchema::Bool(b) => Ok(SchemarsSchema::Bool(b)),
             SchemarsSchema::Object(s) => {
-                let s = if s.is_ref() {
-                    let jp = ref_to_json_path(&s.reference.unwrap())?;
-                    self.dereference_type(&jp)?
+                let mut s = if s.is_ref() {
+                    self.dereference_type(&s.reference.unwrap())?
                 } else {
                     s
                 };
-                //println!("Schema! {:#?}", s);
-                //TODO We should merge and flatten the various subschemas here too.
-                //We can get the various Schema objects from here and use json-patch to merge them
-                //together, or at least to attempt to.
-                SchemarsSchema::Object(s)
+                s.subschemas = match s.subschemas {
+                    Some(mut subschemas) => {
+                        subschemas.all_of = subschemas
+                            .all_of
+                            .map(|olives| {
+                                olives
+                                    .iter()
+                                    .map(|olive| self.dereference_schemars_schema(olive.clone()))
+                                    .collect()
+                            })
+                            .transpose()?;
+                        subschemas.any_of = subschemas
+                            .any_of
+                            .map(|any_ofs| {
+                                any_ofs
+                                    .iter()
+                                    .map(|any_of| self.dereference_schemars_schema(any_of.clone()))
+                                    .collect()
+                            })
+                            .transpose()?;
+                        subschemas.one_of = subschemas
+                            .one_of
+                            .map(|one_ofs| {
+                                one_ofs
+                                    .iter()
+                                    .map(|one_of| self.dereference_schemars_schema(one_of.clone()))
+                                    .collect()
+                            })
+                            .transpose()?;
+                        subschemas.if_schema = subschemas
+                            .if_schema
+                            .map(|if_schema| {
+                                self.dereference_schemars_schema(*if_schema)
+                                    .map(|is| Box::new(is))
+                            })
+                            .transpose()?;
+                        subschemas.else_schema = subschemas
+                            .else_schema
+                            .map(|else_schema| {
+                                self.dereference_schemars_schema(*else_schema)
+                                    .map(|is| Box::new(is))
+                            })
+                            .transpose()?;
+                        subschemas.then_schema = subschemas
+                            .then_schema
+                            .map(|then_schema| {
+                                self.dereference_schemars_schema(*then_schema)
+                                    .map(|is| Box::new(is))
+                            })
+                            .transpose()?;
+                        Some(subschemas)
+                    }
+                    None => None,
+                };
+                Ok(SchemarsSchema::Object(s))
             }
-        };
+        }
+    }
+
+    fn dereference_schemas(&self, mut schema: SchemaObject) -> Result<SchemaObject, OpenApiError> {
+        schema.json_schema = self.dereference_schemars_schema(schema.json_schema)?;
         Ok(schema)
     }
 
@@ -350,7 +404,7 @@ impl OpenApiDereferencer {
             components.schemas = components
                 .schemas
                 .into_iter()
-                .map(|(k, v)| Ok((k, self.dereference_and_merge_schemas(v)?)))
+                .map(|(k, v)| Ok((k, self.dereference_schemas(v)?)))
                 .collect::<Result<IndexMap<String, SchemaObject>, OpenApiError>>()?;
             components.parameters = components
                 .parameters
