@@ -1,0 +1,603 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::path::PathBuf;
+use std::str::FromStr;
+
+use indexmap::IndexMap;
+use jsonpath_rust::JsonPathInst;
+use openapiv3::schemars::schema::Schema as SchemarsSchema;
+use openapiv3::v3_0::{
+    Callback, Components, Example, Header, Link, OpenAPI as OpenApiV3_0, Operation, Parameter,
+    ParameterData, PathItem, Paths, ReferenceOr, RequestBody, Response, Schema, SchemaData,
+    SchemaKind, SecurityScheme, StatusCode, Type,
+};
+use openapiv3::versioned::OpenApi;
+use snafu::prelude::*;
+
+pub struct OpenApiDereferencer {
+    pub json: serde_json::Value,
+    pub openapi: OpenApiV3_0,
+    pub serde_values: RefCell<HashMap<String, serde_json::Value>>,
+}
+#[derive(Debug, Snafu)]
+pub enum OpenApiError {
+    #[snafu(display("Error parsing open api spec {msg}"))]
+    ParsingError { msg: String },
+    #[snafu(display("References must be in the same file and start with #, found {reference}"))]
+    UnsupportedRefFormat { reference: String },
+    #[snafu(display("Unsupported open api version"))]
+    UnsupportedOpenApiVersion,
+}
+
+impl FromStr for OpenApiDereferencer {
+    type Err = OpenApiError;
+    fn from_str(the_str: &str) -> Result<Self, OpenApiError> {
+        let json: serde_json::Value =
+            serde_json::from_str(the_str).map_err(|e| OpenApiError::ParsingError {
+                msg: format!("Error parsing from string to serde {}", e),
+            })?;
+        let openapi: OpenApi =
+            serde_json::from_value(json.clone()).map_err(|e| OpenApiError::ParsingError {
+                msg: format!("Error parsing from serde to OpenApi {}", e),
+            })?;
+        match openapi {
+            OpenApi::Version30(openapi) => Ok(OpenApiDereferencer {
+                json,
+                openapi,
+                serde_values: HashMap::default().into(),
+            }),
+            _ => Err(OpenApiError::UnsupportedOpenApiVersion),
+        }
+    }
+}
+
+pub fn ref_to_json_path(ref_str: &str) -> Result<String, OpenApiError> {
+    let mut chars = ref_str.chars();
+    let first_char = chars.next();
+    if first_char.is_none() || first_char.unwrap() != '#' {
+        return Err(OpenApiError::UnsupportedRefFormat {
+            reference: ref_str.into(),
+        });
+    }
+    chars.next();
+    let path_str: String = chars.collect();
+    let path = PathBuf::from(&path_str);
+    let mut json_path: String = "$".into();
+    for p in path.iter() {
+        if let Some(p) = p.to_str() {
+            json_path += ".";
+            json_path += p;
+        }
+    }
+    Ok(json_path)
+}
+
+impl OpenApiDereferencer {
+    pub fn dereference(mut self) -> Result<OpenApiV3_0, OpenApiError> {
+        let components: Option<Components> = self.openapi.components.take();
+        self.openapi.components = self.dereference_components(components)?;
+        let paths = self.openapi.paths.clone();
+        self.openapi.paths = self.dereference_paths(paths)?;
+        Ok(self.openapi)
+    }
+
+    fn dereference_schemars_schema(
+        &self,
+        schema: SchemarsSchema,
+    ) -> Result<SchemarsSchema, OpenApiError> {
+        match schema {
+            SchemarsSchema::Bool(b) => Ok(SchemarsSchema::Bool(b)),
+            SchemarsSchema::Object(s) => {
+                let mut s = if s.is_ref() {
+                    self.dereference_type(&s.reference.unwrap())?
+                } else {
+                    s
+                };
+                s.subschemas = match s.subschemas {
+                    Some(mut subschemas) => {
+                        subschemas.all_of = subschemas
+                            .all_of
+                            .map(|olives| {
+                                olives
+                                    .iter()
+                                    .map(|olive| self.dereference_schemars_schema(olive.clone()))
+                                    .collect()
+                            })
+                            .transpose()?;
+                        subschemas.any_of = subschemas
+                            .any_of
+                            .map(|any_ofs| {
+                                any_ofs
+                                    .iter()
+                                    .map(|any_of| self.dereference_schemars_schema(any_of.clone()))
+                                    .collect()
+                            })
+                            .transpose()?;
+                        subschemas.one_of = subschemas
+                            .one_of
+                            .map(|one_ofs| {
+                                one_ofs
+                                    .iter()
+                                    .map(|one_of| self.dereference_schemars_schema(one_of.clone()))
+                                    .collect()
+                            })
+                            .transpose()?;
+                        subschemas.if_schema = subschemas
+                            .if_schema
+                            .map(|if_schema| {
+                                self.dereference_schemars_schema(*if_schema).map(Box::new)
+                            })
+                            .transpose()?;
+                        subschemas.else_schema = subschemas
+                            .else_schema
+                            .map(|else_schema| {
+                                self.dereference_schemars_schema(*else_schema).map(Box::new)
+                            })
+                            .transpose()?;
+                        subschemas.then_schema = subschemas
+                            .then_schema
+                            .map(|then_schema| {
+                                self.dereference_schemars_schema(*then_schema).map(Box::new)
+                            })
+                            .transpose()?;
+                        Some(subschemas)
+                    }
+                    None => None,
+                };
+                Ok(SchemarsSchema::Object(s))
+            }
+        }
+    }
+
+    fn dereference_schemakind_type(&self, t: Type) -> Result<Type, OpenApiError> {
+        unimplemented!()
+    }
+
+    fn dereference_schemas(&self, mut schema: Schema) -> Result<Schema, OpenApiError> {
+        schema.schema_kind = match schema.schema_kind {
+            SchemaKind::Type(t) => SchemaKind::Type(self.dereference_schemakind_type(t)?),
+            SchemaKind::OneOf { one_of } => SchemaKind::OneOf {
+                one_of: one_of
+                    .into_iter()
+                    .map(|item| {
+                        self.handle_dereferenced(self.dereference_reference(item)?, &|item| {
+                            self.dereference_schemas(item)
+                        })
+                    })
+                    .collect::<Result<Vec<ReferenceOr<Schema>>, OpenApiError>>()?,
+            },
+            SchemaKind::AllOf { all_of } => SchemaKind::AllOf {
+                all_of: all_of
+                    .into_iter()
+                    .map(|item| {
+                        self.handle_dereferenced(self.dereference_reference(item)?, &|item| {
+                            self.dereference_schemas(item)
+                        })
+                    })
+                    .collect::<Result<Vec<ReferenceOr<Schema>>, OpenApiError>>()?,
+            },
+            SchemaKind::AnyOf { any_of } => SchemaKind::AnyOf {
+                any_of: any_of
+                    .into_iter()
+                    .map(|item| {
+                        self.handle_dereferenced(self.dereference_reference(item)?, &|item| {
+                            self.dereference_schemas(item)
+                        })
+                    })
+                    .collect::<Result<Vec<ReferenceOr<Schema>>, OpenApiError>>()?,
+            },
+            SchemaKind::Any(a) => SchemaKind::Any(a),
+            //NOTE Currently don't care about dereferencing not kinds
+            SchemaKind::Not { not } => SchemaKind::Not { not },
+        };
+        Ok(schema)
+    }
+
+    fn dereference_operation(&self, mut operation: Operation) -> Result<Operation, OpenApiError> {
+        operation.parameters = operation
+            .parameters
+            .into_iter()
+            .map(|v| {
+                self.handle_dereferenced(self.dereference_reference(v)?, &|item| {
+                    self.dereference_parameter(item)
+                })
+            })
+            .collect::<Result<Vec<ReferenceOr<Parameter>>, OpenApiError>>()?;
+        operation.request_body = operation
+            .request_body
+            .map(|v| self.dereference_reference(v))
+            .transpose()?;
+        operation.parameters = operation
+            .parameters
+            .into_iter()
+            .map(|v| {
+                self.handle_dereferenced(self.dereference_reference(v)?, &|item| {
+                    self.dereference_parameter(item)
+                })
+            })
+            .collect::<Result<Vec<ReferenceOr<Parameter>>, OpenApiError>>()?;
+        operation.responses.responses = operation
+            .responses
+            .responses
+            .into_iter()
+            .map(|(status_code, response)| {
+                Ok((
+                    status_code,
+                    self.handle_dereferenced(self.dereference_reference(response)?, &|item| {
+                        self.dereference_response(item)
+                    })?,
+                ))
+            })
+            .collect::<Result<IndexMap<StatusCode, ReferenceOr<Response>>, OpenApiError>>()?;
+        Ok(operation)
+    }
+
+    fn dereference_path_item(&self, mut path_item: PathItem) -> Result<PathItem, OpenApiError> {
+        path_item.get = path_item
+            .get
+            .map(|get| self.dereference_operation(get))
+            .transpose()?;
+        path_item.put = path_item
+            .put
+            .map(|put| self.dereference_operation(put))
+            .transpose()?;
+        path_item.post = path_item
+            .post
+            .map(|post| self.dereference_operation(post))
+            .transpose()?;
+        path_item.delete = path_item
+            .delete
+            .map(|delete| self.dereference_operation(delete))
+            .transpose()?;
+        path_item.options = path_item
+            .options
+            .map(|options| self.dereference_operation(options))
+            .transpose()?;
+        path_item.head = path_item
+            .head
+            .map(|head| self.dereference_operation(head))
+            .transpose()?;
+        path_item.patch = path_item
+            .patch
+            .map(|patch| self.dereference_operation(patch))
+            .transpose()?;
+        path_item.trace = path_item
+            .trace
+            .map(|trace| self.dereference_operation(trace))
+            .transpose()?;
+        path_item.parameters = path_item
+            .parameters
+            .into_iter()
+            .map(|v| {
+                self.handle_dereferenced(self.dereference_reference(v)?, &|item| {
+                    self.dereference_parameter(item)
+                })
+            })
+            .collect::<Result<Vec<ReferenceOr<Parameter>>, OpenApiError>>()?;
+        Ok(path_item)
+    }
+
+    fn handle_dereferenced<T>(
+        &self,
+        v: ReferenceOr<T>,
+        func: &dyn Fn(T) -> Result<T, OpenApiError>,
+    ) -> Result<ReferenceOr<T>, OpenApiError> {
+        match v {
+            ReferenceOr::DereferencedReference { reference, item } => {
+                Ok(ReferenceOr::DereferencedReference {
+                    reference,
+                    item: func(item)?,
+                })
+            }
+            ReferenceOr::Item(item) => Ok(ReferenceOr::Item(func(item)?)),
+            _ => Ok(v),
+        }
+    }
+
+    fn dereference_paths(&self, mut paths: Paths) -> Result<Paths, OpenApiError> {
+        paths.paths = paths
+            .paths
+            .into_iter()
+            .map(|(k, v)| {
+                let new_v = self.handle_dereferenced(self.dereference_reference(v)?, &|item| {
+                    self.dereference_path_item(item)
+                })?;
+                Ok((k, new_v))
+            })
+            .collect::<Result<IndexMap<String, ReferenceOr<PathItem>>, OpenApiError>>()?;
+        Ok(paths)
+    }
+
+    fn dereference_header(&self, mut header: Header) -> Result<Header, OpenApiError> {
+        header.examples = header
+            .examples
+            .into_iter()
+            .map(|(k, v)| {
+                let new_v = self.dereference_reference(v)?;
+                Ok((k, new_v))
+            })
+            .collect::<Result<IndexMap<String, ReferenceOr<Example>>, OpenApiError>>()?;
+        Ok(header)
+    }
+
+    fn dereference_parameter_data(
+        &self,
+        mut parameter_data: ParameterData,
+    ) -> Result<ParameterData, OpenApiError> {
+        //Note examples can have external values, but we don't care at the moment.
+        parameter_data.examples = parameter_data
+            .examples
+            .into_iter()
+            .map(|(k, v)| {
+                let new_v = self.dereference_reference(v)?;
+                Ok((k, new_v))
+            })
+            .collect::<Result<IndexMap<String, ReferenceOr<Example>>, OpenApiError>>()?;
+        Ok(parameter_data)
+    }
+
+    fn dereference_parameter(&self, parameter: Parameter) -> Result<Parameter, OpenApiError> {
+        match parameter {
+            Parameter::Query {
+                parameter_data,
+                allow_reserved,
+                style,
+                allow_empty_value,
+            } => Ok(Parameter::Query {
+                parameter_data: self.dereference_parameter_data(parameter_data)?,
+                allow_reserved,
+                style,
+                allow_empty_value,
+            }),
+            Parameter::Header {
+                parameter_data,
+                style,
+            } => Ok(Parameter::Header {
+                parameter_data: self.dereference_parameter_data(parameter_data)?,
+                style,
+            }),
+            Parameter::Path {
+                parameter_data,
+                style,
+            } => Ok(Parameter::Path {
+                parameter_data: self.dereference_parameter_data(parameter_data)?,
+                style,
+            }),
+            Parameter::Cookie {
+                parameter_data,
+                style,
+            } => Ok(Parameter::Cookie {
+                parameter_data: self.dereference_parameter_data(parameter_data)?,
+                style,
+            }),
+        }
+    }
+
+    fn dereference_response(&self, mut response: Response) -> Result<Response, OpenApiError> {
+        let res: Result<IndexMap<String, ReferenceOr<Header>>, OpenApiError> = response
+            .headers
+            .into_iter()
+            .map(|(k, v)| {
+                let new_v = self.dereference_reference(v)?;
+                Ok((k, new_v))
+            })
+            .collect();
+        response.headers = res?;
+        let res: Result<IndexMap<String, ReferenceOr<Link>>, OpenApiError> = response
+            .links
+            .into_iter()
+            .map(|(k, v)| {
+                let new_v = self.dereference_reference(v)?;
+                Ok((k, new_v))
+            })
+            .collect();
+        response.links = res?;
+        Ok(response)
+    }
+
+    fn dereference_components(
+        &self,
+        components: Option<Components>,
+    ) -> Result<Option<Components>, OpenApiError> {
+        if let Some(mut components) = components {
+            components.security_schemes = components
+                .security_schemes
+                .into_iter()
+                .map(|(k, v)| {
+                    let new_v = self.dereference_reference(v)?;
+                    Ok((k, new_v))
+                })
+                .collect::<Result<IndexMap<String, ReferenceOr<SecurityScheme>>, OpenApiError>>()?;
+            components.responses = components
+                .responses
+                .into_iter()
+                .map(|(k, v)| {
+                    Ok((
+                        k,
+                        self.handle_dereferenced(self.dereference_reference(v)?, &|item| {
+                            self.dereference_response(item)
+                        })?,
+                    ))
+                })
+                .collect::<Result<IndexMap<String, ReferenceOr<Response>>, OpenApiError>>()?;
+            components.schemas = components
+                .schemas
+                .into_iter()
+                .map(|(k, v)| {
+                    Ok((
+                        k,
+                        self.handle_dereferenced(self.dereference_reference(v)?, &|item| {
+                            self.dereference_schemas(item)
+                        })?,
+                    ))
+                })
+                .collect::<Result<IndexMap<String, ReferenceOr<Schema>>, OpenApiError>>()?;
+            components.parameters = components
+                .parameters
+                .into_iter()
+                .map(|(k, v)| {
+                    Ok((
+                        k,
+                        self.handle_dereferenced(self.dereference_reference(v)?, &|item| {
+                            self.dereference_parameter(item)
+                        })?,
+                    ))
+                })
+                .collect::<Result<IndexMap<String, ReferenceOr<Parameter>>, OpenApiError>>()?;
+            components.examples = components
+                .examples
+                .into_iter()
+                .map(|(k, v)| {
+                    let new_v = self.dereference_reference(v)?;
+                    Ok((k, new_v))
+                })
+                .collect::<Result<IndexMap<String, ReferenceOr<Example>>, OpenApiError>>()?;
+            components.request_bodies = components
+                .request_bodies
+                .into_iter()
+                .map(|(k, v)| {
+                    let new_v = self.dereference_reference(v)?;
+                    Ok((k, new_v))
+                })
+                .collect::<Result<IndexMap<String, ReferenceOr<RequestBody>>, OpenApiError>>()?;
+            components.headers = components
+                .headers
+                .into_iter()
+                .map(|(k, v)| {
+                    Ok((
+                        k,
+                        self.handle_dereferenced(self.dereference_reference(v)?, &|item| {
+                            self.dereference_header(item)
+                        })?,
+                    ))
+                })
+                .collect::<Result<IndexMap<String, ReferenceOr<Header>>, OpenApiError>>()?;
+
+            components.links = components
+                .links
+                .into_iter()
+                .map(|(k, v)| {
+                    let new_v = self.dereference_reference(v)?;
+                    Ok((k, new_v))
+                })
+                .collect::<Result<IndexMap<String, ReferenceOr<Link>>, OpenApiError>>()?;
+
+            //I don't think we care about callbacks for the moment.
+            let res: Result<IndexMap<String, ReferenceOr<Callback>>, OpenApiError> = components
+                .callbacks
+                .into_iter()
+                .map(|(k, v)| {
+                    let new_v = self.dereference_reference(v)?;
+                    Ok((k, new_v))
+                })
+                .collect();
+            components.callbacks = res?;
+            Ok(Some(components))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn dereference_type<T: serde::de::DeserializeOwned>(
+        &self,
+        reference: &str,
+    ) -> Result<T, OpenApiError> {
+        let mut cache = self.serde_values.borrow_mut();
+        let value = if let Some(v) = cache.get(reference) {
+            v
+        } else {
+            let jp = ref_to_json_path(reference)?;
+            let query = JsonPathInst::from_str(&jp).map_err(|e| OpenApiError::ParsingError {
+                msg: format!("Error creating json path {jp}, {e}"),
+            })?;
+            let path_result = query.find_slice(&self.json);
+            //TODO Reading the spec, I don't _think_ this needs to work for arrays.
+            let v = path_result.get(0).take().unwrap().deref();
+            cache.insert(reference.into(), v.to_owned());
+            cache.get(reference).unwrap()
+        };
+        serde_json::from_value(value.clone()).map_err(|e| OpenApiError::ParsingError {
+            msg: format!("Error with serde parsing {e} {reference}"),
+        })
+    }
+
+    fn dereference_reference<T: serde::de::DeserializeOwned>(
+        &self,
+        v: ReferenceOr<T>,
+    ) -> Result<ReferenceOr<T>, OpenApiError> {
+        match v {
+            ReferenceOr::Item(i) => Ok(ReferenceOr::Item(i)),
+            ReferenceOr::Reference { reference } => {
+                let item = self.dereference_type(&reference)?;
+                Ok(ReferenceOr::DereferencedReference { reference, item })
+            }
+            ReferenceOr::DereferencedReference { reference, item } => {
+                Ok(ReferenceOr::DereferencedReference { reference, item })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+
+    fn is_reference<T>(reference: (&String, &ReferenceOr<T>)) -> bool {
+        if let ReferenceOr::Reference { reference: _ } = reference.1 {
+            return true;
+        }
+        false
+    }
+
+    #[test]
+    pub fn test_ref_to_json_path() -> Result<()> {
+        let reference = "#/components/parameters/pagination-before";
+        let expected = "$.components.parameters.pagination-before";
+        assert_eq!(expected, &ref_to_json_path(reference)?);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_file_ref_to_json_path() {
+        let reference = "//elsewhere/components/parameters/pagination-before";
+        assert!(ref_to_json_path(reference).is_err());
+    }
+
+    #[test]
+    pub fn test_http_ref_to_json_path() {
+        let reference = "http://mysite.com/components/parameters/pagination-before";
+        assert!(ref_to_json_path(reference).is_err());
+    }
+
+    #[test]
+    pub fn test_github_api_from_3_1_api() -> Result<()> {
+        //NOTE: This is a sanity check. the github api doesn't have _everything_, but it
+        //seems like if that passes, we're reasonably good. We might want something more
+        //comprehensive in the future
+        let spec = std::fs::read_to_string("oai_examples/api.github.com.json")?;
+        let dereferencer = OpenApiDereferencer::from_str(&spec)?;
+        let dereferenced = dereferencer.dereference()?;
+
+        assert!(dereferenced.components.is_some());
+        let components = dereferenced.components.unwrap();
+        assert!(!components.security_schemes.iter().any(is_reference));
+        assert!(!components.responses.iter().any(is_reference));
+        assert!(!components.parameters.iter().any(is_reference));
+        assert!(!components.examples.iter().any(is_reference));
+        assert!(!components.request_bodies.iter().any(is_reference));
+        assert!(!components.headers.iter().any(is_reference));
+        assert!(!components.links.iter().any(is_reference));
+        assert!(!components.callbacks.iter().any(is_reference));
+        //assert!(!components.path_items.iter().any(is_reference));
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_3_0_api_is_err() -> Result<()> {
+        let spec = std::fs::read_to_string("oai_examples/petstore-expanded.json")?;
+        assert!(OpenApiDereferencer::from_str(&spec).is_err());
+        Ok(())
+    }
+}
