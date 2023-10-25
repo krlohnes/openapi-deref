@@ -15,6 +15,7 @@ use openapiv3::v3_1::{
 use openapiv3::versioned::OpenApi;
 use snafu::prelude::*;
 
+#[derive(Default)]
 pub struct OpenApiDereferencer {
     pub json: serde_json::Value,
     pub openapi: OpenApiV3_1,
