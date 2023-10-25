@@ -127,22 +127,19 @@ impl OpenApiDereferencer {
                         subschemas.if_schema = subschemas
                             .if_schema
                             .map(|if_schema| {
-                                self.dereference_schemars_schema(*if_schema)
-                                    .map(Box::new)
+                                self.dereference_schemars_schema(*if_schema).map(Box::new)
                             })
                             .transpose()?;
                         subschemas.else_schema = subschemas
                             .else_schema
                             .map(|else_schema| {
-                                self.dereference_schemars_schema(*else_schema)
-                                    .map(Box::new)
+                                self.dereference_schemars_schema(*else_schema).map(Box::new)
                             })
                             .transpose()?;
                         subschemas.then_schema = subschemas
                             .then_schema
                             .map(|then_schema| {
-                                self.dereference_schemars_schema(*then_schema)
-                                    .map(Box::new)
+                                self.dereference_schemars_schema(*then_schema).map(Box::new)
                             })
                             .transpose()?;
                         Some(subschemas)
@@ -585,6 +582,7 @@ mod tests {
         let spec = std::fs::read_to_string("oai_examples/api.github.com.json")?;
         let dereferencer = OpenApiDereferencer::from_str(&spec)?;
         let dereferenced = dereferencer.dereference()?;
+        std::fs::write("dereffed_gh.json", serde_json::to_string(&dereferenced)?)?;
 
         assert!(dereferenced.components.is_some());
         let components = dereferenced.components.unwrap();
