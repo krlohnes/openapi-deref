@@ -13,6 +13,7 @@ use openapiv3::v3_1::{
     SecurityScheme, StatusCode,
 };
 use openapiv3::versioned::OpenApi;
+use serde_json::Value;
 use snafu::prelude::*;
 
 #[derive(Default)]
@@ -32,13 +33,16 @@ pub enum OpenApiError {
     UnsupportedOpenApiVersion,
 }
 
-impl FromStr for OpenApiDereferencer {
-    type Err = OpenApiError;
-    fn from_str(the_str: &str) -> Result<Self, OpenApiError> {
-        let json: serde_json::Value =
-            serde_json::from_str(the_str).map_err(|e| OpenApiError::ParsingError {
-                msg: format!("Error parsing from string to serde {}", e),
+impl OpenApiDereferencer {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, OpenApiError> {
+        let json: Value =
+            serde_json::from_slice(bytes).map_err(|e| OpenApiError::ParsingError {
+                msg: format!("Error parsing from slice to serde {}", e),
             })?;
+        OpenApiDereferencer::from_value(json)
+    }
+
+    pub fn from_value(json: Value) -> Result<Self, OpenApiError> {
         let openapi: OpenApi =
             serde_json::from_value(json.clone()).map_err(|e| OpenApiError::ParsingError {
                 msg: format!("Error parsing from serde to OpenApi {}", e),
@@ -51,6 +55,18 @@ impl FromStr for OpenApiDereferencer {
             }),
             _ => Err(OpenApiError::UnsupportedOpenApiVersion),
         }
+    }
+}
+
+impl FromStr for OpenApiDereferencer {
+    type Err = OpenApiError;
+
+    fn from_str(the_str: &str) -> Result<Self, OpenApiError> {
+        let json: serde_json::Value =
+            serde_json::from_str(the_str).map_err(|e| OpenApiError::ParsingError {
+                msg: format!("Error parsing from string to serde {}", e),
+            })?;
+        OpenApiDereferencer::from_value(json)
     }
 }
 
