@@ -10,7 +10,7 @@ use openapiv3::schemars::schema::Schema as SchemarsSchema;
 use openapiv3::v3_1::{
     Callback, Components, Example, Header, Link, OpenApi as OpenApiV3_1, Operation, Parameter,
     ParameterData, PathItem, Paths, ReferenceOr, RequestBody, Response, SchemaObject,
-    SecurityScheme, StatusCode,
+    SecurityScheme, Server, StatusCode,
 };
 use openapiv3::versioned::OpenApi;
 use serde_json::Value;
@@ -21,6 +21,7 @@ pub struct OpenApiDereferencer {
     pub json: serde_json::Value,
     pub openapi: OpenApiV3_1,
     pub serde_values: RefCell<HashMap<String, serde_json::Value>>,
+    is_dereferenced: bool,
 }
 
 #[derive(Debug, Snafu)]
@@ -31,9 +32,71 @@ pub enum OpenApiError {
     UnsupportedRefFormat { reference: String },
     #[snafu(display("Unsupported open api version"))]
     UnsupportedOpenApiVersion,
+    #[snafu(display("Must dereference before getting servers"))]
+    DerefBeforeGettingServers,
 }
 
 impl OpenApiDereferencer {
+    ///Get a list of servers from all levels of the spec. You _must_ run derefence before calling
+    ///this. Doing otherwise will result in an error.
+    pub fn get_servers(&self) -> Result<Vec<Server>, OpenApiError> {
+        if !self.is_dereferenced {
+            return Err(OpenApiError::DerefBeforeGettingServers);
+        }
+        let mut servers: Vec<Server> = self
+            .openapi
+            .servers
+            .iter()
+            .map(|server| server.clone())
+            .collect();
+
+        if let Some(paths) = &self.openapi.paths {
+            for (_, path) in &paths.paths {
+                match path {
+                    ReferenceOr::Item(item) => {
+                        let mut more_servers = item
+                            .servers
+                            .iter()
+                            .map(|server| server.clone())
+                            .collect::<Vec<Server>>();
+                        servers.append(&mut more_servers);
+                        item.get.as_ref().map(|o| {
+                            let mut more_servers = o
+                                .servers
+                                .iter()
+                                .map(|server| server.clone())
+                                .collect::<Vec<Server>>();
+                            servers.append(&mut more_servers);
+                        });
+                    }
+                    ReferenceOr::DereferencedReference {
+                        reference: _,
+                        summary: _,
+                        description: _,
+                        item,
+                    } => {
+                        let mut more_servers = item
+                            .servers
+                            .iter()
+                            .map(|server| server.clone())
+                            .collect::<Vec<Server>>();
+                        servers.append(&mut more_servers);
+                        item.get.as_ref().map(|o| {
+                            let mut more_servers = o
+                                .servers
+                                .iter()
+                                .map(|server| server.clone())
+                                .collect::<Vec<Server>>();
+                            servers.append(&mut more_servers);
+                        });
+                    }
+                    _ => return Err(OpenApiError::DerefBeforeGettingServers),
+                }
+            }
+        }
+        Ok(servers)
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, OpenApiError> {
         let json: Value =
             serde_json::from_slice(bytes).map_err(|e| OpenApiError::ParsingError {
@@ -52,6 +115,7 @@ impl OpenApiDereferencer {
                 json,
                 openapi,
                 serde_values: HashMap::default().into(),
+                is_dereferenced: false,
             }),
             _ => Err(OpenApiError::UnsupportedOpenApiVersion),
         }
@@ -612,6 +676,39 @@ mod tests {
         assert!(!components.links.iter().any(is_reference));
         assert!(!components.callbacks.iter().any(is_reference));
         assert!(!components.path_items.iter().any(is_reference));
+
+        let mut max = 0;
+        let mut sum = 0;
+        let paths = dereferenced.paths.unwrap();
+        for (_, ref_or_pi) in &paths.paths {
+            match ref_or_pi {
+                ReferenceOr::Item(item) => {
+                    let bytes_size = serde_json::to_string(&item)?.as_bytes().len();
+                    sum += bytes_size;
+                    if bytes_size > max {
+                        max = bytes_size;
+                    }
+                }
+                ReferenceOr::DereferencedReference {
+                    reference: _,
+                    summary: _,
+                    description: _,
+                    item,
+                } => {
+                    let bytes_size = serde_json::to_string(&item)?.as_bytes().len();
+                    sum += bytes_size;
+                    if bytes_size > max {
+                        max = bytes_size;
+                    }
+                }
+                _ => {
+                    assert!(false)
+                }
+            }
+        }
+
+        println!("Max size {}", max);
+        println!("average size {}", sum as f64 / paths.paths.len() as f64);
         Ok(())
     }
 
