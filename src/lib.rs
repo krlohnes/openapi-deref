@@ -156,13 +156,13 @@ pub fn ref_to_json_path(ref_str: &str) -> Result<String, OpenApiError> {
 }
 
 impl OpenApiDereferencer {
-    pub fn dereference(mut self) -> Result<OpenApiV3_1, OpenApiError> {
+    pub fn dereference(mut self) -> Result<Self, OpenApiError> {
         let components: Option<Components> = self.openapi.components.take();
         self.openapi.components = self.dereference_components(components)?;
         let paths: Option<Paths> = self.openapi.paths.take();
         self.openapi.paths = self.dereference_paths(paths)?;
         self.is_dereferenced = true;
-        Ok(self.openapi)
+        Ok(self)
     }
 
     fn dereference_schemars_schema(
