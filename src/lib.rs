@@ -161,6 +161,7 @@ impl OpenApiDereferencer {
         self.openapi.components = self.dereference_components(components)?;
         let paths: Option<Paths> = self.openapi.paths.take();
         self.openapi.paths = self.dereference_paths(paths)?;
+        self.is_dereferenced = true;
         Ok(self.openapi)
     }
 
